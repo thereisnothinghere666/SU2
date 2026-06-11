@@ -1,73 +1,177 @@
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import glob
 
-from acoustics.observers import create_observers
-from acoustics.fwh import FWHSolver
-from acoustics.spl import spl
-from acoustics.fft_tools import spectrum
-from acoustics.loader_history import load_history
+from scipy.signal import welch
+from scipy.fft import rfft, rfftfreq
 
-dt = 5e-4
+# =====================================================
+# PARAMETRY
+# =====================================================
 
-surface, pressure = load_history(
-    "data/flow"
+gamma = 1.4
+
+dt = 5e-4             # krok czasowy [s]
+U_inf = 30.0          # prędkość napływu [m/s]
+chord = 1.0           # cięciwa [m]
+
+x_obs = 1.5           # punkt obserwacyjny
+y_obs = 0.5
+
+# =====================================================
+# WCZYTANIE PLIKÓW
+# =====================================================
+
+files = sorted(glob.glob("data/restart_flow_*.csv"))
+
+if len(files) < 10:
+    raise ValueError("Za mało plików do analizy.")
+
+print(f"Znaleziono {len(files)} snapshotów")
+
+# =====================================================
+# WYBÓR PUNKTU OBSERWACYJNEGO
+# =====================================================
+
+ref = pd.read_csv(files[0])
+
+dist = np.sqrt(
+    (ref["x"] - x_obs)**2 +
+    (ref["y"] - y_obs)**2
 )
 
-solver = FWHSolver(surface)
+idx = np.argmin(dist)
 
-observers = create_observers(
-    radius=10.0,
-    n=10
-)
+print("\nPunkt obserwacyjny:")
+print(ref.loc[idx, ["x", "y"]])
 
-all_spl = []
+# =====================================================
+# HISTORIE CZASOWE
+# =====================================================
 
-for obs in observers:
+pressure_history = []
+mass_history = []
+energy_history = []
 
-    signal = solver.pressure_signal(
-        obs,
-        pressure,
-        dt
+for file in files:
+
+    df = pd.read_csv(file)
+
+    rho = df["Density"].values
+    rhou = df["Momentum_x"].values
+    rhov = df["Momentum_y"].values
+    E = df["Energy"].values
+
+    u = rhou / rho
+    v = rhov / rho
+
+    pressure = (gamma - 1.0) * (
+        E - 0.5 * rho * (u*u + v*v)
     )
 
-    level = spl(signal)
+    # punkt obserwacyjny
+    pressure_history.append(pressure[idx])
 
-    all_spl.append(level)
+    # całkowita masa
+    mass_history.append(np.sum(rho))
 
-    freq, spec = spectrum(
-        signal,
-        dt
-    )
+    # całkowita energia
+    energy_history.append(np.sum(E))
 
-    plt.figure()
+pressure_history = np.array(pressure_history)
+mass_history = np.array(mass_history)
+energy_history = np.array(energy_history)
 
-    plt.plot(freq, spec)
+time = np.arange(len(files)) * dt
 
-    plt.xlabel("Frequency [Hz]")
-    plt.ylabel("SPL [dB]")
+# =====================================================
+# FLUKTUACJE CIŚNIENIA
+# =====================================================
 
-    plt.savefig(
-        f"results/spec_{obs[0]:.1f}_{obs[1]:.1f}.png"
-    )
+p_mean = np.mean(pressure_history)
+p_prime = pressure_history - p_mean
 
-plt.figure()
+p_rms = np.sqrt(np.mean(p_prime**2))
 
-angles = np.linspace(
-    0,
-    2*np.pi,
-    len(all_spl),
-    endpoint=False
+# =====================================================
+# SPL
+# =====================================================
+
+p_ref = 20e-6
+
+SPL = 20 * np.log10(p_rms / p_ref)
+
+print("\n=== AKUSTYKA ===")
+print(f"p_rms = {p_rms:.6f} Pa")
+print(f"SPL   = {SPL:.2f} dB")
+
+# =====================================================
+# FFT
+# =====================================================
+
+N = len(p_prime)
+
+freq = rfftfreq(N, dt)
+fft_amp = np.abs(rfft(p_prime))
+
+peak_index = np.argmax(fft_amp[1:]) + 1
+peak_frequency = freq[peak_index]
+
+print(f"\nDominująca częstotliwość: {peak_frequency:.2f} Hz")
+
+# =====================================================
+# STROUHAL
+# =====================================================
+
+St = peak_frequency * chord / U_inf
+
+print(f"Liczba Strouhala: {St:.4f}")
+
+# =====================================================
+# PSD
+# =====================================================
+
+f_psd, psd = welch(
+    p_prime,
+    fs=1/dt,
+    nperseg=min(1024, N)
 )
 
-ax = plt.subplot(
-    projection="polar"
-)
+# =====================================================
+# WYKRESY
+# =====================================================
 
-ax.plot(
-    angles,
-    all_spl
-)
+plt.figure(figsize=(10,5))
+plt.plot(time, pressure_history)
+plt.title("Ciśnienie całkowite")
+plt.xlabel("t [s]")
+plt.ylabel("p [Pa]")
+plt.grid()
+plt.tight_layout()
 
-plt.savefig(
-    "results/directivity.png"
-)
+plt.figure(figsize=(10,5))
+plt.plot(time, p_prime)
+plt.title("Fluktuacje ciśnienia")
+plt.xlabel("t [s]")
+plt.ylabel("p' [Pa]")
+plt.grid()
+plt.tight_layout()
+
+plt.figure(figsize=(10,5))
+plt.semilogy(freq, fft_amp)
+plt.title("FFT")
+plt.xlabel("f [Hz]")
+plt.ylabel("Amplitude")
+plt.grid()
+plt.tight_layout()
+
+plt.figure(figsize=(10,5))
+plt.semilogy(f_psd, psd)
+plt.title("PSD (Welch)")
+plt.xlabel("f [Hz]")
+plt.ylabel("PSD")
+plt.grid()
+plt.tight_layout()
+
+plt.show()
